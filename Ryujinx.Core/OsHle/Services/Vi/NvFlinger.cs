@@ -1,20 +1,26 @@
 using ChocolArm64.Memory;
 using Ryujinx.Core.OsHle.Handles;
+using Ryujinx.Core.OsHle.Services.Nv;
+using Ryujinx.Graphics.Gal;
+using Ryujinx.Graphics.Gpu;
 using System;
-using System.IO;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Threading;
+using static Ryujinx.Core.OsHle.Services.Android.Parcel;
 
-using static Ryujinx.Core.OsHle.IpcServices.Android.Parcel;
-
-namespace Ryujinx.Core.OsHle.IpcServices.Android
+namespace Ryujinx.Core.OsHle.Services.Android
 {
     class NvFlinger : IDisposable
     {
         private delegate long ServiceProcessParcel(ServiceCtx Context, BinaryReader ParcelReader);
 
         private Dictionary<(string, int), ServiceProcessParcel> Commands;
+
+        private KEvent ReleaseEvent;
+
+        private IGalRenderer Renderer;
 
         private const int BufferQueueCount = 0x40;
         private const int BufferQueueMask  = BufferQueueCount - 1;
@@ -58,14 +64,15 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
 
         private ManualResetEvent WaitBufferFree;
 
-        private bool KeepRunning;
+        private bool Disposed;
 
-        public NvFlinger()
+        public NvFlinger(IGalRenderer Renderer, KEvent ReleaseEvent)
         {
             Commands = new Dictionary<(string, int), ServiceProcessParcel>()
             {
                 { ("android.gui.IGraphicBufferProducer", 0x1), GbpRequestBuffer  },
                 { ("android.gui.IGraphicBufferProducer", 0x3), GbpDequeueBuffer  },
+                { ("android.gui.IGraphicBufferProducer", 0x4), GbpDetachBuffer   },
                 { ("android.gui.IGraphicBufferProducer", 0x7), GbpQueueBuffer    },
                 { ("android.gui.IGraphicBufferProducer", 0x8), GbpCancelBuffer   },
                 { ("android.gui.IGraphicBufferProducer", 0x9), GbpQuery          },
@@ -74,11 +81,12 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
                 { ("android.gui.IGraphicBufferProducer", 0xe), GbpPreallocBuffer }
             };
 
+            this.Renderer     = Renderer;
+            this.ReleaseEvent = ReleaseEvent;
+
             BufferQueue = new BufferEntry[0x40];
 
             WaitBufferFree = new ManualResetEvent(false);
-
-            KeepRunning = true;
         }
 
         public long ProcessParcelRequest(ServiceCtx Context, byte[] ParcelData, int Code)
@@ -104,7 +112,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
 
                 if (Commands.TryGetValue((InterfaceName, Code), out ServiceProcessParcel ProcReq))
                 {
-                    Logging.Debug($"{InterfaceName} {ProcReq.Method.Name}");
+                    Logging.Debug(LogClass.ServiceNv, $"{InterfaceName} {ProcReq.Method.Name}");
 
                     return ProcReq(Context, Reader);
                 }
@@ -122,7 +130,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
             using (MemoryStream MS = new MemoryStream())
             {
                 BinaryWriter Writer = new BinaryWriter(MS);
-                
+
                 BufferEntry Entry = BufferQueue[Slot];
 
                 int  BufferCount = 1; //?
@@ -193,6 +201,11 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
             return MakeReplyParcel(Context, 1280, 720, 0, 0, 0);
         }
 
+        private long GbpDetachBuffer(ServiceCtx Context, BinaryReader ParcelReader)
+        {
+            return MakeReplyParcel(Context, 0);
+        }
+
         private long GbpCancelBuffer(ServiceCtx Context, BinaryReader ParcelReader)
         {
             //TODO: Errors.
@@ -221,13 +234,17 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
         private long GbpPreallocBuffer(ServiceCtx Context, BinaryReader ParcelReader)
         {
             int Slot = ParcelReader.ReadInt32();
-            
-            int  BufferCount = ParcelReader.ReadInt32();
-            long BufferSize  = ParcelReader.ReadInt64();
 
-            BufferQueue[Slot].State = BufferState.Free;
+            int BufferCount = ParcelReader.ReadInt32();
 
-            BufferQueue[Slot].Data = new GbpBuffer(ParcelReader);
+            if (BufferCount > 0)
+            {
+                long BufferSize = ParcelReader.ReadInt64();
+
+                BufferQueue[Slot].State = BufferState.Free;
+
+                BufferQueue[Slot].Data = new GbpBuffer(ParcelReader);
+            }
 
             return MakeReplyParcel(Context, 0);
         }
@@ -259,24 +276,24 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
             return 0;
         }
 
-        private unsafe void SendFrameBuffer(ServiceCtx Context, int Slot)
+        private void SendFrameBuffer(ServiceCtx Context, int Slot)
         {
-            int FbWidth  = BufferQueue[Slot].Data.Width;
-            int FbHeight = BufferQueue[Slot].Data.Height;
+            int FbWidth  = 1280;
+            int FbHeight = 720;
 
-            int FbSize = FbWidth * FbHeight * 4;
+            NvMap Map = GetNvMap(Context, Slot);
 
-            HNvMap NvMap = GetNvMap(Context, Slot);
+            NvMapFb MapFb = (NvMapFb)INvDrvServices.NvMapsFb.GetData(Context.Process, 0);
 
-            if (FbSize < 0 || NvMap.Address < 0 || NvMap.Address + FbSize > AMemoryMgr.AddrSize)
+            long CpuAddr = Map.CpuAddress;
+            long GpuAddr = Map.GpuAddress;
+
+            if (MapFb.HasBufferOffset(Slot))
             {
-                Logging.Error($"Frame buffer address {NvMap.Address:x16} is invalid!");
+                CpuAddr += MapFb.GetBufferOffset(Slot);
 
-                BufferQueue[Slot].State = BufferState.Free;
-
-                WaitBufferFree.Set();
-
-                return;
+                //TODO: Enable once the frame buffers problems are fixed.
+                //GpuAddr += MapFb.GetBufferOffset(Slot);
             }
 
             BufferQueue[Slot].State = BufferState.Acquired;
@@ -330,30 +347,31 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
                 Rotate = -MathF.PI * 0.5f;
             }
 
-            byte* Fb = (byte*)Context.Ns.Ram + NvMap.Address;
+            Renderer.SetFrameBufferTransform(ScaleX, ScaleY, Rotate, OffsX, OffsY);
 
-            Context.Ns.Gpu.Renderer.QueueAction(delegate()
+            //TODO: Support double buffering here aswell, it is broken for GPU
+            //frame buffers because it seems to be completely out of sync.
+            if (Context.Ns.Gpu.Engine3d.IsFrameBufferPosition(GpuAddr))
             {
-                Context.Ns.Gpu.Renderer.SetFrameBuffer(
-                    Fb,
-                    FbWidth,
-                    FbHeight,
-                    ScaleX,
-                    ScaleY,
-                    OffsX,
-                    OffsY,
-                    Rotate);
+                //Frame buffer is rendered to by the GPU, we can just
+                //bind the frame buffer texture, it's not necessary to read anything.
+                Renderer.SetFrameBuffer(GpuAddr);
+            }
+            else
+            {
+                //Frame buffer is not set on the GPU registers, in this case
+                //assume that the app is manually writing to it.
+                Texture Texture = new Texture(CpuAddr, FbWidth, FbHeight);
 
-                BufferQueue[Slot].State = BufferState.Free;
+                byte[] Data = TextureReader.Read(Context.Memory, Texture);
 
-                lock (WaitBufferFree)
-                {
-                    WaitBufferFree.Set();
-                }
-            });
+                Renderer.SetFrameBuffer(Data, FbWidth, FbHeight);
+            }
+
+            Context.Ns.Gpu.Renderer.QueueAction(() => ReleaseBuffer(Slot));
         }
 
-        private HNvMap GetNvMap(ServiceCtx Context, int Slot)
+        private NvMap GetNvMap(ServiceCtx Context, int Slot)
         {
             int NvMapHandle = BitConverter.ToInt32(BufferQueue[Slot].Data.RawData, 0x4c);
 
@@ -366,7 +384,19 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
                 NvMapHandle = BitConverter.ToInt32(RawValue, 0);
             }
 
-            return Context.Ns.Os.Handles.GetData<HNvMap>(NvMapHandle);
+            return INvDrvServices.NvMaps.GetData<NvMap>(Context.Process, NvMapHandle);
+        }
+
+        private void ReleaseBuffer(int Slot)
+        {
+            BufferQueue[Slot].State = BufferState.Free;
+
+            ReleaseEvent.WaitEvent.Set();
+
+            lock (WaitBufferFree)
+            {
+                WaitBufferFree.Set();
+            }
         }
 
         private int GetFreeSlotBlocking(int Width, int Height)
@@ -382,9 +412,9 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
                         break;
                     }
 
-                    Logging.Debug("Waiting for a free BufferQueue slot...");
+                    Logging.Debug(LogClass.ServiceNv, "Waiting for a free BufferQueue slot...");
 
-                    if (!KeepRunning)
+                    if (Disposed)
                     {
                         break;
                     }
@@ -394,9 +424,9 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
 
                 WaitBufferFree.WaitOne();
             }
-            while (KeepRunning);
+            while (!Disposed);
 
-            Logging.Debug($"Found free BufferQueue slot {Slot}!");
+            Logging.Debug(LogClass.ServiceNv, $"Found free BufferQueue slot {Slot}!");
 
             return Slot;
         }
@@ -432,14 +462,14 @@ namespace Ryujinx.Core.OsHle.IpcServices.Android
             Dispose(true);
         }
 
-        protected virtual void Dispose(bool disposing)
+        protected virtual void Dispose(bool Disposing)
         {
-            if (disposing)
+            if (Disposing && !Disposed)
             {
+                Disposed = true;
+
                 lock (WaitBufferFree)
                 {
-                    KeepRunning = false;
-
                     WaitBufferFree.Set();
                 }
 

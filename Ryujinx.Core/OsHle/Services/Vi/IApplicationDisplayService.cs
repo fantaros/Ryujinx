@@ -1,19 +1,19 @@
 using ChocolArm64.Memory;
-using Ryujinx.Core.OsHle.Handles;
 using Ryujinx.Core.OsHle.Ipc;
 using System.Collections.Generic;
 using System.IO;
 
-using static Ryujinx.Core.OsHle.IpcServices.Android.Parcel;
-using static Ryujinx.Core.OsHle.IpcServices.ObjHelper;
+using static Ryujinx.Core.OsHle.Services.Android.Parcel;
 
-namespace Ryujinx.Core.OsHle.IpcServices.Vi
+namespace Ryujinx.Core.OsHle.Services.Vi
 {
-    class IApplicationDisplayService : IIpcService
+    class IApplicationDisplayService : IpcService
     {
         private Dictionary<int, ServiceProcessRequest> m_Commands;
 
-        public IReadOnlyDictionary<int, ServiceProcessRequest> Commands => m_Commands;
+        public override IReadOnlyDictionary<int, ServiceProcessRequest> Commands => m_Commands;
+
+        private IdDictionary Displays;
 
         public IApplicationDisplayService()
         {
@@ -25,17 +25,21 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
                 {  103, GetIndirectDisplayTransactionService },
                 { 1010, OpenDisplay                          },
                 { 1020, CloseDisplay                         },
+                { 1102, GetDisplayResolution                 },
                 { 2020, OpenLayer                            },
                 { 2021, CloseLayer                           },
                 { 2030, CreateStrayLayer                     },
+                { 2031, DestroyStrayLayer                    },
                 { 2101, SetLayerScalingMode                  },
                 { 5202, GetDisplayVSyncEvent                 }
             };
+
+            Displays = new IdDictionary();
         }
 
         public long GetRelayService(ServiceCtx Context)
         {
-            MakeObject(Context, new IHOSBinderDriver());
+            MakeObject(Context, new IHOSBinderDriver(Context.Ns.Gpu.Renderer));
 
             return 0;
         }
@@ -56,7 +60,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
 
         public long GetIndirectDisplayTransactionService(ServiceCtx Context)
         {
-            MakeObject(Context, new IHOSBinderDriver());
+            MakeObject(Context, new IHOSBinderDriver(Context.Ns.Gpu.Renderer));
 
             return 0;
         }
@@ -65,7 +69,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
         {
             string Name = GetDisplayName(Context);
 
-            long DisplayId = Context.Ns.Os.Displays.GenerateId(new Display(Name));
+            long DisplayId = Displays.Add(new Display(Name));
 
             Context.ResponseData.Write(DisplayId);
 
@@ -76,7 +80,17 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
         {
             int DisplayId = Context.RequestData.ReadInt32();
 
-            Context.Ns.Os.Displays.Delete(DisplayId);
+            Displays.Delete(DisplayId);
+
+            return 0;
+        }
+
+        public long GetDisplayResolution(ServiceCtx Context)
+        {
+            long DisplayId = Context.RequestData.ReadInt32();
+
+            Context.ResponseData.Write(1280);
+            Context.ResponseData.Write(720);
 
             return 0;
         }
@@ -99,6 +113,8 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
 
         public long CloseLayer(ServiceCtx Context)
         {
+            long LayerId = Context.RequestData.ReadInt64();
+
             return 0;
         }
 
@@ -109,7 +125,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
 
             long ParcelPtr = Context.Request.ReceiveBuff[0].Position;
 
-            Display Disp = Context.Ns.Os.Displays.GetData<Display>((int)DisplayId);
+            Display Disp = Displays.GetData<Display>((int)DisplayId);
 
             byte[] Parcel = MakeIGraphicsBufferProducer(ParcelPtr);
 
@@ -118,6 +134,11 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
             Context.ResponseData.Write(0L);
             Context.ResponseData.Write((long)Parcel.Length);
 
+            return 0;
+        }
+
+        public long DestroyStrayLayer(ServiceCtx Context)
+        {
             return 0;
         }
 
@@ -133,7 +154,7 @@ namespace Ryujinx.Core.OsHle.IpcServices.Vi
         {
             string Name = GetDisplayName(Context);
 
-            int Handle = Context.Ns.Os.Handles.GenerateId(new HEvent());
+            int Handle = Context.Process.HandleTable.OpenHandle(Context.Ns.Os.VsyncEvent);
 
             Context.Response.HandleDesc = IpcHandleDesc.MakeCopy(Handle);
 

@@ -1,33 +1,24 @@
 using Ryujinx.Core.Loaders.Executables;
 using Ryujinx.Core.OsHle.Handles;
-using Ryujinx.Core.OsHle.Utilities;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
 
 namespace Ryujinx.Core.OsHle
 {
-    public class Horizon
+    public class Horizon : IDisposable
     {
         internal const int HidSize  = 0x40000;
         internal const int FontSize = 0x50;
 
-        internal int HidHandle  { get; private set; }
-        internal int FontHandle { get; private set; }
-
-        internal IdPool IdGen    { get; private set; }
-        internal IdPool NvMapIds { get; private set; }
-
-        internal IdPoolWithObj Handles  { get; private set; }
-        internal IdPoolWithObj Fds      { get; private set; }
-        internal IdPoolWithObj Displays { get; private set; }
-
-        public ConcurrentDictionary<long, Mutex>   Mutexes  { get; private set; }
-        public ConcurrentDictionary<long, CondVar> CondVars { get; private set; }
+        private KProcessScheduler Scheduler;
 
         private ConcurrentDictionary<int, Process> Processes;
 
-        internal HSharedMem HidSharedMem;
+        internal HSharedMem HidSharedMem  { get; private set; }
+        internal HSharedMem FontSharedMem { get; private set; }
+
+        internal KEvent VsyncEvent { get; private set; }
 
         private Switch Ns;
 
@@ -35,23 +26,14 @@ namespace Ryujinx.Core.OsHle
         {
             this.Ns = Ns;
 
-            IdGen    = new IdPool();
-            NvMapIds = new IdPool();
-
-            Handles  = new IdPoolWithObj();
-            Fds      = new IdPoolWithObj();
-            Displays = new IdPoolWithObj();
-
-            Mutexes  = new ConcurrentDictionary<long, Mutex>();
-            CondVars = new ConcurrentDictionary<long, CondVar>();
+            Scheduler = new KProcessScheduler();
 
             Processes = new ConcurrentDictionary<int, Process>();
 
-            HidSharedMem = new HSharedMem();
+            HidSharedMem  = new HSharedMem();
+            FontSharedMem = new HSharedMem();
 
-            HidHandle = Handles.GenerateId(HidSharedMem);
-
-            FontHandle = Handles.GenerateId(new HSharedMem());
+            VsyncEvent = new KEvent();
         }
 
         public void LoadCart(string ExeFsDir, string RomFsFile = null)
@@ -61,9 +43,7 @@ namespace Ryujinx.Core.OsHle
                 Ns.VFs.LoadRomFs(RomFsFile);
             }
 
-            int ProcessId = IdGen.GenerateId();
-
-            Process MainProcess = new Process(Ns, ProcessId);
+            Process MainProcess = MakeProcess();
 
             void LoadNso(string FileName)
             {
@@ -74,11 +54,13 @@ namespace Ryujinx.Core.OsHle
                         continue;
                     }
 
-                    Logging.Info($"Loading {Path.GetFileNameWithoutExtension(File)}...");
+                    Logging.Info(LogClass.Loader, $"Loading {Path.GetFileNameWithoutExtension(File)}...");
 
                     using (FileStream Input = new FileStream(File, FileMode.Open))
                     {
-                        Nso Program = new Nso(Input);
+                        string Name = Path.GetFileNameWithoutExtension(File);
+
+                        Nso Program = new Nso(Input, Name);
 
                         MainProcess.LoadProgram(Program);
                     }
@@ -94,55 +76,90 @@ namespace Ryujinx.Core.OsHle
             LoadNso("sdk");
 
             MainProcess.Run();
-
-            Processes.TryAdd(ProcessId, MainProcess);
         }
 
         public void LoadProgram(string FileName)
         {
             bool IsNro = Path.GetExtension(FileName).ToLower() == ".nro";
 
-            int ProcessId = IdGen.GenerateId();
+            string Name = Path.GetFileNameWithoutExtension(FileName);
 
-            Process MainProcess = new Process(Ns, ProcessId);
+            Process MainProcess = MakeProcess();
 
             using (FileStream Input = new FileStream(FileName, FileMode.Open))
             {
                 MainProcess.LoadProgram(IsNro
-                    ? (IExecutable)new Nro(Input)
-                    : (IExecutable)new Nso(Input));
+                    ? (IExecutable)new Nro(Input, Name)
+                    : (IExecutable)new Nso(Input, Name));
             }
 
             MainProcess.SetEmptyArgs();
             MainProcess.Run(IsNro);
-
-            Processes.TryAdd(ProcessId, MainProcess);
         }
 
-        public void FinalizeAllProcesses()
+        public void SignalVsync() => VsyncEvent.WaitEvent.Set();
+
+        private Process MakeProcess()
         {
-            foreach (Process Process in Processes.Values)
+            Process Process;
+
+            lock (Processes)
             {
-                Process.StopAllThreads();
+                int ProcessId = 0;
+
+                while (Processes.ContainsKey(ProcessId))
+                {
+                    ProcessId++;
+                }
+
+                Process = new Process(Ns, Scheduler, ProcessId);
+
+                Processes.TryAdd(ProcessId, Process);
+            }
+
+            InitializeProcess(Process);
+
+            return Process;
+        }
+
+        private void InitializeProcess(Process Process)
+        {
+            Process.AppletState.SetFocus(true);
+        }
+
+        internal void ExitProcess(int ProcessId)
+        {
+            if (Processes.TryGetValue(ProcessId, out Process Process) && Process.NeedsHbAbi)
+            {
+                string NextNro = Homebrew.ReadHbAbiNextLoadPath(Process.Memory, Process.HbAbiDataPosition);
+
+                Logging.Info(LogClass.Loader, $"HbAbi NextLoadPath {NextNro}");
+
+                if (NextNro == string.Empty)
+                {
+                    NextNro = "sdmc:/hbmenu.nro";
+                }
+
+                NextNro = NextNro.Replace("sdmc:", string.Empty);
+
+                NextNro = Ns.VFs.GetFullPath(Ns.VFs.GetSdCardPath(), NextNro);
+
+                if (File.Exists(NextNro))
+                {
+                    LoadProgram(NextNro);
+                }
+            }
+
+            if (Processes.TryRemove(ProcessId, out Process))
+            {
+                Process.StopAllThreadsAsync();
                 Process.Dispose();
-            }
-        }
 
-        internal bool ExitProcess(int ProcessId)
-        {
-            bool Success = Processes.TryRemove(ProcessId, out Process Process);
-            
-            if (Success)
-            {
-                Process.StopAllThreads();
+                if (Processes.Count == 0)
+                {
+                    Ns.OnFinish(EventArgs.Empty);
+                }
             }
-
-            if (Processes.Count == 0)
-            {
-                Ns.OnFinish(EventArgs.Empty);
-            }
-
-            return Success;
         }
 
         internal bool TryGetProcess(int ProcessId, out Process Process)
@@ -150,19 +167,25 @@ namespace Ryujinx.Core.OsHle
             return Processes.TryGetValue(ProcessId, out Process);
         }
 
-        internal void CloseHandle(int Handle)
+        public void Dispose()
         {
-            object HndData = Handles.GetData<object>(Handle);
+            Dispose(true);
+        }
 
-            if (HndData is HTransferMem TransferMem)
+        protected virtual void Dispose(bool Disposing)
+        {
+            if (Disposing)
             {
-                TransferMem.Memory.Manager.Reprotect(
-                    TransferMem.Position,
-                    TransferMem.Size,
-                    TransferMem.Perm);
-            }
+                foreach (Process Process in Processes.Values)
+                {
+                    Process.StopAllThreadsAsync();
+                    Process.Dispose();
+                }
 
-            Handles.Delete(Handle);
+                VsyncEvent.Dispose();
+
+                Scheduler.Dispose();
+            }
         }
     }
 }

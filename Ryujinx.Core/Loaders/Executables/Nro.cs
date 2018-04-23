@@ -1,18 +1,14 @@
-using System;
-using System.Collections.ObjectModel;
 using System.IO;
 
 namespace Ryujinx.Core.Loaders.Executables
 {
     class Nro : IExecutable
     {
-        private byte[] m_Text;
-        private byte[] m_RO;
-        private byte[] m_Data;
+        public string Name { get; private set; }
 
-        public ReadOnlyCollection<byte> Text => Array.AsReadOnly(m_Text);
-        public ReadOnlyCollection<byte> RO   => Array.AsReadOnly(m_RO);
-        public ReadOnlyCollection<byte> Data => Array.AsReadOnly(m_Data);
+        public byte[] Text { get; private set; }
+        public byte[] RO   { get; private set; }
+        public byte[] Data { get; private set; }
 
         public int Mod0Offset { get; private set; }
         public int TextOffset { get; private set; }
@@ -20,8 +16,10 @@ namespace Ryujinx.Core.Loaders.Executables
         public int DataOffset { get; private set; }
         public int BssSize    { get; private set; }
 
-        public Nro(Stream Input)
+        public Nro(Stream Input, string Name)
         {
+            this.Name = Name;
+
             BinaryReader Reader = new BinaryReader(Input);
 
             Input.Seek(4, SeekOrigin.Begin);
@@ -54,9 +52,9 @@ namespace Ryujinx.Core.Loaders.Executables
                 return Reader.ReadBytes(Size);
             }
 
-            m_Text = Read(TextOffset, TextSize);
-            m_RO   = Read(ROOffset,   ROSize);
-            m_Data = Read(DataOffset, DataSize);
+            Text = Read(TextOffset, TextSize);
+            RO   = Read(ROOffset,   ROSize);
+            Data = Read(DataOffset, DataSize);
         }
     }
 }

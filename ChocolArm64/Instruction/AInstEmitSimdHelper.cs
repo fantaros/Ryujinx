@@ -100,6 +100,52 @@ namespace ChocolArm64.Instruction
             Context.EmitCall(MthdInfo);
         }
 
+        public static void EmitUnarySoftFloatCall(AILEmitterCtx Context, string Name)
+        {
+            IAOpCodeSimd Op = (IAOpCodeSimd)Context.CurrOp;
+
+            int SizeF = Op.Size & 1;
+
+            MethodInfo MthdInfo;
+
+            if (SizeF == 0)
+            {
+                MthdInfo = typeof(ASoftFloat).GetMethod(Name, new Type[] { typeof(float) });
+            }
+            else /* if (SizeF == 1) */
+            {
+                MthdInfo = typeof(ASoftFloat).GetMethod(Name, new Type[] { typeof(double) });
+            }
+
+            Context.EmitCall(MthdInfo);
+        }
+
+        public static void EmitScalarBinaryOpByElemF(AILEmitterCtx Context, Action Emit)
+        {
+            AOpCodeSimdRegElemF Op = (AOpCodeSimdRegElemF)Context.CurrOp;
+
+            EmitScalarOpByElemF(Context, Emit, Op.Index, Ternary: false);
+        }
+
+        public static void EmitScalarOpByElemF(AILEmitterCtx Context, Action Emit, int Elem, bool Ternary)
+        {
+            AOpCodeSimdReg Op = (AOpCodeSimdReg)Context.CurrOp;
+
+            int SizeF = Op.Size & 1;
+
+            if (Ternary)
+            {
+                EmitVectorExtractF(Context, Op.Rd, 0, SizeF);
+            }
+
+            EmitVectorExtractF(Context, Op.Rn, 0,    SizeF);
+            EmitVectorExtractF(Context, Op.Rm, Elem, SizeF);
+
+            Emit();
+
+            EmitScalarSetF(Context, Op.Rd, SizeF);
+        }
+
         public static void EmitScalarUnaryOpSx(AILEmitterCtx Context, Action Emit)
         {
             EmitScalarOp(Context, Emit, OperFlags.Rn, true);
@@ -190,6 +236,11 @@ namespace ChocolArm64.Instruction
             EmitScalarSetF(Context, Op.Rd, SizeF);
         }
 
+        public static void EmitVectorUnaryOpF(AILEmitterCtx Context, Action Emit)
+        {
+            EmitVectorOpF(Context, Emit, OperFlags.Rn);
+        }
+
         public static void EmitVectorBinaryOpF(AILEmitterCtx Context, Action Emit)
         {
             EmitVectorOpF(Context, Emit, OperFlags.RnRm);
@@ -202,7 +253,7 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorOpF(AILEmitterCtx Context, Action Emit, OperFlags Opers)
         {
-            AOpCodeSimdReg Op = (AOpCodeSimdReg)Context.CurrOp;
+            AOpCodeSimd Op = (AOpCodeSimd)Context.CurrOp;
 
             int SizeF = Op.Size & 1;
 
@@ -222,7 +273,7 @@ namespace ChocolArm64.Instruction
 
                 if (Opers.HasFlag(OperFlags.Rm))
                 {
-                    EmitVectorExtractF(Context, Op.Rm, Index, SizeF);
+                    EmitVectorExtractF(Context, ((AOpCodeSimdReg)Op).Rm, Index, SizeF);
                 }
 
                 Emit();
@@ -376,12 +427,15 @@ namespace ChocolArm64.Instruction
                 }
 
                 EmitVectorExtract(Context, Op.Rn, Index, Op.Size, Signed);
-                EmitVectorExtract(Context, Op.Rm, Index, Op.Size, Signed);
+                EmitVectorExtract(Context, Op.Rm, Elem,  Op.Size, Signed);
 
                 Emit();
 
-                EmitVectorInsert(Context, Op.Rd, Index, Op.Size);
+                EmitVectorInsertTmp(Context, Index, Op.Size);
             }
+
+            Context.EmitLdvectmp();
+            Context.EmitStvec(Op.Rd);
 
             if (Op.RegisterSize == ARegisterSize.SIMD64)
             {
@@ -439,6 +493,9 @@ namespace ChocolArm64.Instruction
         {
             AOpCodeSimdReg Op = (AOpCodeSimdReg)Context.CurrOp;
 
+            Context.EmitLdvec(Op.Rd);
+            Context.EmitStvectmp();
+
             int Elems = 8 >> Op.Size;
 
             int Part = Op.RegisterSize == ARegisterSize.SIMD128 ? Elems : 0;
@@ -480,6 +537,9 @@ namespace ChocolArm64.Instruction
         public static void EmitVectorWidenRnRmOp(AILEmitterCtx Context, Action Emit, bool Ternary, bool Signed)
         {
             AOpCodeSimdReg Op = (AOpCodeSimdReg)Context.CurrOp;
+
+            Context.EmitLdvec(Op.Rd);
+            Context.EmitStvectmp();
 
             int Elems = 8 >> Op.Size;
 
@@ -528,10 +588,7 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorExtract(AILEmitterCtx Context, int Reg, int Index, int Size, bool Signed)
         {
-            if (Size < 0 || Size > 3)
-            {
-                throw new ArgumentOutOfRangeException(nameof(Size));
-            }
+            ThrowIfInvalid(Index, Size);
 
             IAOpCodeSimd Op = (IAOpCodeSimd)Context.CurrOp;
 
@@ -546,6 +603,8 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorExtractF(AILEmitterCtx Context, int Reg, int Index, int Size)
         {
+            ThrowIfInvalidF(Index, Size);
+
             Context.EmitLdvec(Reg);
             Context.EmitLdc_I4(Index);
 
@@ -581,10 +640,7 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorInsert(AILEmitterCtx Context, int Reg, int Index, int Size)
         {
-            if (Size < 0 || Size > 3)
-            {
-                throw new ArgumentOutOfRangeException(nameof(Size));
-            }
+            ThrowIfInvalid(Index, Size);
 
             Context.EmitLdvec(Reg);
             Context.EmitLdc_I4(Index);
@@ -597,10 +653,7 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorInsertTmp(AILEmitterCtx Context, int Index, int Size)
         {
-            if (Size < 0 || Size > 3)
-            {
-                throw new ArgumentOutOfRangeException(nameof(Size));
-            }
+            ThrowIfInvalid(Index, Size);
 
             Context.EmitLdvectmp();
             Context.EmitLdc_I4(Index);
@@ -613,10 +666,7 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorInsert(AILEmitterCtx Context, int Reg, int Index, int Size, long Value)
         {
-            if (Size < 0 || Size > 3)
-            {
-                throw new ArgumentOutOfRangeException(nameof(Size));
-            }
+            ThrowIfInvalid(Index, Size);
 
             Context.EmitLdc_I8(Value);
             Context.EmitLdvec(Reg);
@@ -630,6 +680,8 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorInsertF(AILEmitterCtx Context, int Reg, int Index, int Size)
         {
+            ThrowIfInvalidF(Index, Size);
+
             Context.EmitLdvec(Reg);
             Context.EmitLdc_I4(Index);
 
@@ -651,6 +703,8 @@ namespace ChocolArm64.Instruction
 
         public static void EmitVectorInsertTmpF(AILEmitterCtx Context, int Index, int Size)
         {
+            ThrowIfInvalidF(Index, Size);
+
             Context.EmitLdvectmp();
             Context.EmitLdc_I4(Index);
 
@@ -668,6 +722,32 @@ namespace ChocolArm64.Instruction
             }
 
             Context.EmitStvectmp();
+        }
+
+        private static void ThrowIfInvalid(int Index, int Size)
+        {
+            if ((uint)Size > 3)
+            {
+                throw new ArgumentOutOfRangeException(nameof(Size));
+            }
+
+            if ((uint)Index >= 16 >> Size)
+            {
+                throw new ArgumentOutOfRangeException(nameof(Index));
+            }
+        }
+
+        private static void ThrowIfInvalidF(int Index, int Size)
+        {
+            if ((uint)Size > 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(Size));
+            }
+
+            if ((uint)Index >= 4 >> Size)
+            {
+                throw new ArgumentOutOfRangeException(nameof(Index));
+            }
         }
     }
 }
